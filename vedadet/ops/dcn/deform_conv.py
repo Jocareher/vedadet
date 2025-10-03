@@ -8,7 +8,18 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair, _single
 
-from . import deform_conv_ext
+# Intentar cargar la extensión nativa
+_HAS_EXT = True
+try:
+    from . import deform_conv_ext
+except Exception:
+    _HAS_EXT = False
+    # shim torchvision
+    from .torchvision_dcn import (
+        DeformConv2dPackTV,
+        ModulatedDeformConv2dPackTV,
+    )
+
 
 
 class DeformConvFunction(Function):

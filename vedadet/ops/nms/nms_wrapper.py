@@ -3,144 +3,175 @@
 import numpy as np
 import torch
 
-from . import nms_ext
+# Intentar extensión nativa
+try:
+    from . import nms_ext  # compilada por setup.py
+    _HAS_EXT = True
+except Exception:
+    nms_ext = None
+    _HAS_EXT = False
+
+def _as_tensor(dets, device_id=None):
+    """Convierte dets (np.ndarray o Tensor) a Tensor y devuelve (tensor, is_numpy)."""
+    if isinstance(dets, torch.Tensor):
+        return dets, False
+    elif isinstance(dets, np.ndarray):
+        device = 'cpu' if device_id is None else f'cuda:{device_id}'
+        return torch.from_numpy(dets).to(device), True
+    else:
+        raise TypeError(f'dets must be Tensor or numpy array, got {type(dets)}')
 
 
 def nms(dets, iou_thr, device_id=None):
-    """Dispatch to either CPU or GPU NMS implementations.
-
-    The input can be either a torch tensor or numpy array. GPU NMS will be used
-    if the input is a gpu tensor or device_id is specified, otherwise CPU NMS
-    will be used. The returned type will always be the same as inputs.
-
-    Arguments:
-        dets (torch.Tensor or np.ndarray): bboxes with scores.
-        iou_thr (float): IoU threshold for NMS.
-        device_id (int, optional): when `dets` is a numpy array, if `device_id`
-            is None, then cpu nms is used, otherwise gpu_nms will be used.
-
-    Returns:
-        tuple: kept bboxes and indice, which is always the same data type as
-            the input.
-
-    Example:
-        >>> dets = np.array([[49.1, 32.4, 51.0, 35.9, 0.9],
-        >>>                  [49.3, 32.9, 51.0, 35.3, 0.9],
-        >>>                  [49.2, 31.8, 51.0, 35.4, 0.5],
-        >>>                  [35.1, 11.5, 39.1, 15.7, 0.5],
-        >>>                  [35.6, 11.8, 39.3, 14.2, 0.5],
-        >>>                  [35.3, 11.5, 39.9, 14.5, 0.4],
-        >>>                  [35.2, 11.7, 39.7, 15.7, 0.3]], dtype=np.float32)
-        >>> iou_thr = 0.6
-        >>> suppressed, inds = nms(dets, iou_thr)
-        >>> assert len(inds) == len(suppressed) == 3
+    """NMS estándar.
+    Entrada: dets (N,5) con [x1,y1,x2,y2,score] en Tensor o ndarray.
+    Devuelve: (dets_kept_mismo_tipo, indices) manteniendo el tipo de la entrada.
     """
-    # convert dets (tensor or numpy array) to tensor
-    if isinstance(dets, torch.Tensor):
-        is_numpy = False
-        dets_th = dets
-    elif isinstance(dets, np.ndarray):
-        is_numpy = True
-        device = 'cpu' if device_id is None else f'cuda:{device_id}'
-        dets_th = torch.from_numpy(dets).to(device)
-    else:
-        raise TypeError('dets must be either a Tensor or numpy array, '
-                        f'but got {type(dets)}')
+    dets_th, is_numpy = _as_tensor(dets, device_id=device_id)
 
-    # execute cpu or cuda nms
-    if dets_th.shape[0] == 0:
+    if dets_th.numel() == 0:
         inds = dets_th.new_zeros(0, dtype=torch.long)
-    else:
-        if dets_th.is_cuda:
-            inds = nms_ext.nms(dets_th, iou_thr)
-        else:
-            inds = nms_ext.nms(dets_th, iou_thr)
+        return (dets if is_numpy else dets_th)[inds, :], (inds.cpu().numpy() if is_numpy else inds)
 
+    # separar boxes y scores
+    if dets_th.size(-1) == 5:
+        boxes = dets_th[:, :4]
+        scores = dets_th[:, 4]
+    else:
+        raise ValueError(f'nms expects dets with shape (N,5), got {tuple(dets_th.shape)}')
+
+    # Si la extensión existe se usa; si no, fallback a torchvision.ops.nms
+    if _HAS_EXT:
+        inds = nms_ext.nms(dets_th, float(iou_thr))
+    else:
+        from torchvision.ops import nms as tv_nms
+        inds = tv_nms(boxes, scores, float(iou_thr))
+
+    # preservar tipo de salida
     if is_numpy:
-        inds = inds.cpu().numpy()
-    return dets[inds, :], inds
+        inds_np = inds.detach().cpu().numpy()
+        return dets[inds_np, :], inds_np
+    else:
+        return dets_th[inds, :], inds
+
+
+def _soft_nms_torch(dets_t: torch.Tensor, iou_thr: float, method: str = 'linear',
+                    sigma: float = 0.5, min_score: float = 1e-3):
+    """
+    Soft-NMS puro PyTorch (CPU/GPU), O(N^2), similar al paper:
+      - method: 'linear' | 'gaussian'
+      - dets_t: Tensor [N,5] -> x1,y1,x2,y2,score
+    Devuelve (new_dets[N_kept,5], inds[N_kept]) ordenados por score desc.
+    """
+    assert dets_t.dim() == 2 and dets_t.size(1) == 5, "dets must be (N,5)"
+    device = dets_t.device
+    dtype = dets_t.dtype
+
+    boxes = dets_t[:, :4].clone()
+    scores = dets_t[:, 4].clone()
+
+    # Ordenar por score desc
+    order = torch.argsort(scores, descending=True)
+    boxes = boxes[order]
+    scores = scores[order]
+    keep_inds = []
+
+    # IoU helper
+    def box_iou_single(box, boxes):
+        # box: (4,), boxes: (M,4)
+        x1 = torch.maximum(box[0], boxes[:, 0])
+        y1 = torch.maximum(box[1], boxes[:, 1])
+        x2 = torch.minimum(box[2], boxes[:, 2])
+        y2 = torch.minimum(box[3], boxes[:, 3])
+        inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+        area1 = (box[2] - box[0]).clamp(min=0) * (box[3] - box[1]).clamp(min=0)
+        area2 = (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (boxes[:, 3] - boxes[:, 1]).clamp(min=0)
+        union = area1 + area2 - inter
+        iou = torch.where(union > 0, inter / union, torch.zeros_like(union))
+        return iou
+
+    i = 0
+    while i < boxes.size(0):
+        # actual top
+        max_box = boxes[i]
+        max_score = scores[i]
+        if max_score < min_score:
+            break
+        keep_inds.append(i)
+
+        if i + 1 >= boxes.size(0):
+            break
+
+        ious = box_iou_single(max_box, boxes[i+1:])
+        if method == 'linear':
+            weights = torch.where(ious > iou_thr, 1 - ious, torch.ones_like(ious, device=device, dtype=dtype))
+        elif method == 'gaussian':
+            weights = torch.exp(-(ious * ious) / sigma)
+        else:  # 'original' behavior
+            weights = torch.where(ious > iou_thr, torch.zeros_like(ious), torch.ones_like(ious))
+
+        scores[i+1:] = scores[i+1:] * weights
+
+        # filtrar por min_score y reordenar la cola
+        remain = scores[i+1:] >= min_score
+        if remain.any():
+            # mantener y resort por score
+            keep_mask = torch.cat([torch.ones((i+1,), dtype=torch.bool, device=device), remain])
+            boxes = boxes[keep_mask]
+            scores = scores[keep_mask]
+            # resort segment i+1..end
+            if i + 1 < boxes.size(0):
+                tail_scores = scores[i+1:]
+                tail_order = torch.argsort(tail_scores, descending=True)
+                boxes[i+1:] = boxes[i+1:][tail_order]
+                scores[i+1:] = tail_scores[tail_order]
+            i += 1
+        else:
+            # no queda nada por encima de min_score
+            break
+
+    keep_inds_t = torch.tensor(keep_inds, device=device, dtype=torch.long)
+    kept = torch.cat([boxes[keep_inds_t], scores[keep_inds_t][:, None]], dim=1)
+    return kept, keep_inds_t
 
 
 def soft_nms(dets, iou_thr, method='linear', sigma=0.5, min_score=1e-3):
-    """Dispatch to only CPU Soft NMS implementations.
-
-    The input can be either a torch tensor or numpy array.
-    The returned type will always be the same as inputs.
-
-    Arguments:
-        dets (torch.Tensor or np.ndarray): bboxes with scores.
-        iou_thr (float): IoU threshold for Soft NMS.
-        method (str): either 'linear' or 'gaussian'
-        sigma (float): hyperparameter for gaussian method
-        min_score (float): score filter threshold
-
-    Returns:
-        tuple: new det bboxes and indice, which is always the same
-        data type as the input.
-
-    Example:
-        >>> dets = np.array([[4., 3., 5., 3., 0.9],
-        >>>                  [4., 3., 5., 4., 0.9],
-        >>>                  [3., 1., 3., 1., 0.5],
-        >>>                  [3., 1., 3., 1., 0.5],
-        >>>                  [3., 1., 3., 1., 0.4],
-        >>>                  [3., 1., 3., 1., 0.0]], dtype=np.float32)
-        >>> iou_thr = 0.6
-        >>> new_dets, inds = soft_nms(dets, iou_thr, sigma=0.5)
-        >>> assert len(inds) == len(new_dets) == 5
+    """Soft-NMS.
+    Entrada: dets (N,5) [x1,y1,x2,y2,score]
+    Salida: (new_dets, inds) igual que original.
     """
-    # convert dets (tensor or numpy array) to tensor
+    # convert dets (tensor or numpy array) to tensor on CPU (algoritmo no necesita kernel custom)
     if isinstance(dets, torch.Tensor):
         is_tensor = True
-        dets_t = dets.detach().cpu()
+        dets_t = dets.detach()  # en el mismo device, puede ser cuda
     elif isinstance(dets, np.ndarray):
         is_tensor = False
         dets_t = torch.from_numpy(dets)
     else:
-        raise TypeError('dets must be either a Tensor or numpy array, '
-                        f'but got {type(dets)}')
+        raise TypeError(f'dets must be Tensor or numpy array, got {type(dets)}')
 
-    method_codes = {'linear': 1, 'gaussian': 2}
-    if method not in method_codes:
-        raise ValueError(f'Invalid method for SoftNMS: {method}')
-    results = nms_ext.soft_nms(dets_t, iou_thr, method_codes[method], sigma,
-                               min_score)
-
-    new_dets = results[:, :5]
-    inds = results[:, 5]
-
-    if is_tensor:
-        return new_dets.to(
-            device=dets.device, dtype=dets.dtype), inds.to(
-                device=dets.device, dtype=torch.long)
+    # Usar extensión si existe; si no, fallback
+    if _HAS_EXT:
+            results = nms_ext.soft_nms(dets_t.detach().cpu(), float(iou_thr),
+                                       1 if method == 'linear' else 2, float(sigma), float(min_score))
+            new_dets = results[:, :5]
+            inds = results[:, 5].long()
+            if is_tensor:
+                return new_dets.to(device=dets.device, dtype=dets.dtype), inds.to(device=dets.device, dtype=torch.long)
+            else:
+                return new_dets.numpy().astype(dets.dtype), inds.cpu().numpy().astype(np.int64)
     else:
-        return new_dets.numpy().astype(dets.dtype), inds.numpy().astype(
-            np.int64)
+        new_dets, inds = _soft_nms_torch(dets_t, float(iou_thr), method=method, sigma=float(sigma), min_score=float(min_score))
+        if is_tensor:
+            return new_dets.to(device=dets.device, dtype=dets.dtype), inds.to(device=dets.device, dtype=torch.long)
+        else:
+            return new_dets.detach().cpu().numpy().astype(dets.dtype), inds.detach().cpu().numpy().astype(np.int64)
 
 
 def batched_nms(bboxes, scores, inds, nms_cfg, class_agnostic=False):
     """Performs non-maximum suppression in a batched fashion.
 
-    Modified from https://github.com/pytorch/vision/blob
-    /505cd6957711af790211896d32b40291bea1bc21/torchvision/ops/boxes.py#L39.
-    In order to perform NMS independently per class, we add an offset to all
-    the boxes. The offset is dependent only on the class idx, and is large
-    enough so that boxes from different classes do not overlap.
-
-    Arguments:
-        bboxes (torch.Tensor): bboxes in shape (N, 4).
-        scores (torch.Tensor): scores in shape (N, ).
-        inds (torch.Tensor): each index value correspond to a bbox cluster,
-            and NMS will not be applied between elements of different inds,
-            shape (N, ).
-        nms_cfg (dict): specify nms type and class_agnostic as well as other
-            parameters like iou_thr.
-        class_agnostic (bool): if true, nms is class agnostic,
-            i.e. IoU thresholding happens over all bboxes,
-            regardless of the predicted class
-
-    Returns:
-        tuple: kept bboxes and indice.
+    (Sin cambios relevantes: llama a nms_op que ahora puede ser fallback.)
     """
     nms_cfg_ = nms_cfg.copy()
     class_agnostic = nms_cfg_.pop('class_agnostic', class_agnostic)
@@ -159,34 +190,68 @@ def batched_nms(bboxes, scores, inds, nms_cfg, class_agnostic=False):
     return torch.cat([bboxes, scores[:, None]], -1), keep
 
 
+def _nms_match_fallback(dets_t: torch.Tensor, thresh: float):
+    """Agrupa índices por NMS al estilo 'nms_match'.
+    Entrada dets_t: (N,5) [x1,y1,x2,y2,score] (Tensor).
+    Devuelve: List[List[int]] grupos, cada grupo ordenado por score.
+    """
+    assert dets_t.dim() == 2 and dets_t.size(1) == 5
+    boxes = dets_t[:, :4]
+    scores = dets_t[:, 4]
+    # ordenar por score desc
+    order = torch.argsort(scores, descending=True)
+    boxes = boxes[order]
+    idxs = torch.arange(boxes.size(0), device=boxes.device, dtype=torch.long)
+
+    from torchvision.ops import box_iou
+    iou_mat = box_iou(boxes, boxes)  # (N,N)
+
+    visited = torch.zeros(boxes.size(0), dtype=torch.bool, device=boxes.device)
+    groups = []
+    for i in range(boxes.size(0)):
+        if visited[i]:
+            continue
+        # grupo para la caja i: todas j>=i con iou >= thresh que todavía no estén visitadas
+        mask = (iou_mat[i] >= thresh) & (~visited)
+        members = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        # marcar visitados
+        visited[members] = True
+        # mapear a índices originales (antes del sort)
+        orig_members = order[members].tolist()
+        # ordenar los miembros por score desc (ya lo están porque 'order' lo garantizó)
+        groups.append(orig_members)
+    return groups
+
+
 def nms_match(dets, thresh):
     """Matched dets into different groups by NMS.
 
-    NMS match is Similar to NMS but when a bbox is suppressed, nms match will
-    record the indice of supporessed bbox and form a group with the indice of
-    kept bbox. In each group, indice is sorted as score order.
-
-    Arguments:
-        dets (torch.Tensor | np.ndarray): Det bboxes with scores, shape (N, 5).
-        iou_thr (float): IoU thresh for NMS.
-
-    Returns:
-        List[Tensor | ndarray]: The outer list corresponds different matched
-            group, the inner Tensor corresponds the indices for a group in
-            score order.
+    Entrada: dets (N,5) -> [x1,y1,x2,y2,score], Tensor o ndarray
+    Salida: List[Tensor | ndarray] (grupos de índices)
     """
-    if dets.shape[0] == 0:
+    if isinstance(dets, torch.Tensor):
+        dets_t = dets.detach()
+        is_tensor = True
+    elif isinstance(dets, np.ndarray):
+        dets_t = torch.from_numpy(dets)
+        is_tensor = False
+    else:
+        raise TypeError(f'dets must be Tensor or numpy array, got {type(dets)}')
+
+    if dets_t.shape[0] == 0:
         matched = []
     else:
-        assert dets.shape[-1] == 5, 'inputs dets.shape should be (N, 5), ' \
-                                    f'but get {dets.shape}'
-        if isinstance(dets, torch.Tensor):
-            dets_t = dets.detach().cpu()
+        assert dets_t.shape[-1] == 5, f'inputs dets.shape should be (N,5), but get {tuple(dets_t.shape)}'
+        if _HAS_EXT:
+            matched = nms_ext.nms_match(dets_t.detach().cpu(), float(thresh))
+            # `matched` es lista de listas de índices (int) respecto a dets_t.cpu()
+            # convertimos a índices del mismo tipo que espera abajo
         else:
-            dets_t = torch.from_numpy(dets)
-        matched = nms_ext.nms_match(dets_t, thresh)
+            matched = _nms_match_fallback(dets_t, float(thresh))
 
-    if isinstance(dets, torch.Tensor):
-        return [dets.new_tensor(m, dtype=torch.long) for m in matched]
+    if is_tensor:
+        # salida como lista de tensores long (como el original)
+        return [dets_t.new_tensor(m, dtype=torch.long) for m in matched]
     else:
-        return [np.array(m, dtype=np.int) for m in matched]
+        # numpy: usa int nativo (np.int está deprecado)
+        return [np.array(m, dtype=np.int64) for m in matched]
