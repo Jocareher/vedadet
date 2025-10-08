@@ -143,6 +143,7 @@ def main():
         try:
             # prepara batch
             img, img_metas = run_pipeline_on_image(data_pipeline, ip, device)
+            print(f"[INFO] Procesando {ip.name}, img.shape={img.shape}")
 
             # inferencia (como en tu script original)
             result = engine.infer(img, img_metas)[0]  # lista por clase
@@ -153,10 +154,12 @@ def main():
             # guarda txt
             txt_path = out_lbls / f"{ip.stem}.txt"
             save_txt(txt_path, dets)
+            print(f"[INFO]   Detecciones guardadas: {len(dets)} en {txt_path.name}")
 
             # guarda imagen con bboxes
             out_img_path = out_imgs / ip.name
             draw_and_save(str(ip), dets, str(out_img_path), color=(255, 0, 255), thickness=1, font_scale=0.5)
+            print(f"[INFO]   Imagen guardada en {out_img_path.name}")
 
         except Exception as e:
             print(f"[WARN] Falló {ip.name}: {e}")
