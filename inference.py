@@ -66,6 +66,9 @@ def run_pipeline_on_image(pipeline, img_path, device):
     else:
         img = data["img"][0].data
         img_metas = data["img_metas"][0].data
+    
+    img = torch.tensor(img[0].data)
+    img = img.unsqueeze(0)
     return img, img_metas
 
 
